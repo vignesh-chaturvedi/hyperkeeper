@@ -1,0 +1,26 @@
+# HIP-4 shadow settlement on mainnet: predicts each binaryPrice market and checks it against
+# the venue's settlement. Sends nothing.
+#   sudo cp deploy/hyperkeeper-hip4-shadow.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hyperkeeper-hip4-shadow
+#   journalctl -u hyperkeeper-hip4-shadow -f
+[Unit]
+Description=hyperkeeper HIP-4 shadow settlement (mainnet, no writes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=keeper
+WorkingDirectory=/home/keeper/hyperkeeper
+ExecStart=/home/keeper/hyperkeeper/target/release/hyperkeeper hip4-shadow --network mainnet --lookahead-minutes 30 --out /home/keeper/hyperkeeper/data
+Environment=RUST_LOG=hyperkeeper=info
+Restart=always
+RestartSec=10
+MemoryMax=300M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/keeper/hyperkeeper/data
+
+[Install]
+WantedBy=multi-user.target

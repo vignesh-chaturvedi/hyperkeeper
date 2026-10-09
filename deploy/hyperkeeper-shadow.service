@@ -1,0 +1,25 @@
+# Shadow-mode keeper as a systemd service. Sends nothing that can take effect.
+#   sudo cp deploy/hyperkeeper-shadow.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hyperkeeper-shadow
+#   journalctl -u hyperkeeper-shadow -f
+[Unit]
+Description=hyperkeeper shadow run (HIP-3 oracle, no writes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=keeper
+WorkingDirectory=/home/keeper/hyperkeeper
+ExecStart=/home/keeper/hyperkeeper/target/release/hyperkeeper shadow --config /home/keeper/hyperkeeper/deploy/shadow-ignp.toml --out /home/keeper/hyperkeeper/data
+Environment=RUST_LOG=hyperkeeper=info
+Restart=always
+RestartSec=10
+MemoryMax=300M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/keeper/hyperkeeper/data
+
+[Install]
+WantedBy=multi-user.target

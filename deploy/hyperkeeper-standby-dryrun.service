@@ -1,0 +1,25 @@
+# Dry-run standby: follows a primary's oracle updates through the explorer and logs when it
+# would have taken over. Sends nothing.
+#   sudo cp deploy/hyperkeeper-standby-dryrun.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hyperkeeper-standby-dryrun
+#   journalctl -u hyperkeeper-standby-dryrun -f
+[Unit]
+Description=hyperkeeper dry-run standby (failover rehearsal, no writes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=keeper
+WorkingDirectory=/home/keeper/hyperkeeper
+ExecStart=/home/keeper/hyperkeeper/target/release/hyperkeeper run --dry-run --config /home/keeper/hyperkeeper/deploy/standby-ignp.toml
+Environment=RUST_LOG=hyperkeeper=info
+Restart=always
+RestartSec=10
+MemoryMax=300M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

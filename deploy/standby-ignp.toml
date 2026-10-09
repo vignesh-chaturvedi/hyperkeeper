@@ -1,0 +1,44 @@
+# Dry-run standby to ignp's oracle key: how often would a backup have stepped in?
+# ignp updates about every 12 s, so the takeover threshold sits above that.
+network = "testnet"
+dex = "ignp"
+star = true          # ignp is a HIP-3* venue, oracle set with star.setOracle
+interval_ms = 3000
+
+[sources]
+spot = ["coinbase", "binance", "bybit", "kraken", "okx", "hyperliquid-oracle"]
+perp = ["hyperliquid-perp", "binance-perp", "bybit-perp", "okx-perp"]
+max_age_ms = 10000
+min_sources = 2
+max_deviation_bps = 100
+convention = "usd"      # usd | usdt | as-quoted: currency every venue's price is converted to
+
+[guards]
+max_move_bps = 200       # cap per 3 s update; bigger moves converge over several updates
+unsent_alarm_ticks = 3   # alarm after this many updates in a row can't be sent
+
+[[asset]]
+coin = "ignp:BTC"
+symbol = "BTC"
+
+[[asset]]
+coin = "ignp:ETH"
+symbol = "ETH"
+
+[[asset]]
+coin = "ignp:SOL"
+symbol = "SOL"
+
+[[asset]]
+coin = "ignp:AVAX"
+symbol = "AVAX"
+
+[[asset]]
+coin = "ignp:DOGE"
+symbol = "DOGE"
+
+[failover]
+role = "standby"
+peer = "0xa595aD9F3c46dD0f5bd0593e6530D4b74927c403"   # ignp's hip3Star:setOracle key
+takeover_after_ms = 15000
+poll_ms = 5000

@@ -1,0 +1,26 @@
+[package]
+name = "hyperkeeper"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Open-source operations keeper for Hyperliquid HIP-3 and HIP-4 deployers"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+alloy = { version = "2", default-features = false, features = ["signer-local", "signer-keystore"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["now"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+# Pinned to the hypersdk commit that merged trailing stops (#95); it includes the HIP-4
+# outcomeDeploy venue fix (#93), which no release has yet.
+hypersdk = { git = "https://github.com/infinitefield/hypersdk", rev = "23814557d0c3a8b929dc6ddc796bb9ed7484fae6" }
+reqwest = { version = "0.13", features = ["json"] }
+rust_decimal = { version = "1.39", features = ["macros", "maths"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

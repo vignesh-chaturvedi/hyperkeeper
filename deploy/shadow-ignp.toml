@@ -1,0 +1,38 @@
+# Shadow-mode example: price a HIP-3* test DEX (`ignp` on testnet) from public
+# exchange APIs, and compare against the oracle its deployer actually pushes.
+network = "testnet"
+dex = "ignp"
+star = true          # ignp is a HIP-3* venue, oracle set with star.setOracle
+interval_ms = 3000
+
+[sources]
+spot = ["coinbase", "binance", "bybit", "kraken", "okx", "hyperliquid-oracle"]
+perp = ["hyperliquid-perp", "binance-perp", "bybit-perp", "okx-perp"]
+max_age_ms = 10000
+min_sources = 2
+max_deviation_bps = 100
+convention = "usd"      # usd | usdt | as-quoted: currency every venue's price is converted to
+
+[guards]
+max_move_bps = 200       # cap per 3 s update; bigger moves converge over several updates
+unsent_alarm_ticks = 3   # alarm after this many updates in a row can't be sent
+
+[[asset]]
+coin = "ignp:BTC"
+symbol = "BTC"
+
+[[asset]]
+coin = "ignp:ETH"
+symbol = "ETH"
+
+[[asset]]
+coin = "ignp:SOL"
+symbol = "SOL"
+
+[[asset]]
+coin = "ignp:AVAX"
+symbol = "AVAX"
+
+[[asset]]
+coin = "ignp:DOGE"
+symbol = "DOGE"
