@@ -3058,7 +3058,7 @@ dependencies = [
 [[package]]
 name = "hypersdk"
 version = "0.2.18"
-source = "git+https://github.com/infinitefield/hypersdk?rev=23814557d0c3a8b929dc6ddc796bb9ed7484fae6#23814557d0c3a8b929dc6ddc796bb9ed7484fae6"
+source = "git+https://github.com/infinitefield/hypersdk?rev=2c8d9a8487fa972eb1b975eea294a38b7cb69582#2c8d9a8487fa972eb1b975eea294a38b7cb69582"
 dependencies = [
  "alloy",
  "anyhow",

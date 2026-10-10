@@ -14,7 +14,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
 use futures::StreamExt;
 use hypersdk::hypercore::{
     self, CandleInterval, HttpClient,
@@ -23,7 +22,6 @@ use hypersdk::hypercore::{
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Serialize;
-use serde_json::Value;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
@@ -95,27 +93,9 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn info_url(network: Network) -> &'static str {
-    match network {
-        Network::Mainnet => "https://api.hyperliquid.xyz/info",
-        Network::Testnet => "https://api.hyperliquid-testnet.xyz/info",
-    }
-}
-
 pub async fn run(options: Options) -> anyhow::Result<()> {
     let network = options.network;
     let client = HttpClient::new(network.chain());
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(crate::USER_AGENT)
-        .build()?;
-    let post = |body: Value| {
-        let http = http.clone();
-        async move {
-            let response = http.post(info_url(network)).json(&body).send().await?;
-            anyhow::Ok(response.error_for_status()?.json::<Value>().await?)
-        }
-    };
 
     fs::create_dir_all(&options.out_dir)?;
     let log_path = options.out_dir.join(format!(
@@ -203,21 +183,19 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         // Follow markets whose window closes within the lookahead.
         if last_refresh.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
             last_refresh = Some(Instant::now());
-            match post(serde_json::json!({"type": "outcomeMeta"})).await {
+            match client.outcome_meta().await {
                 Ok(meta) => {
-                    for outcome in meta["outcomes"].as_array().into_iter().flatten() {
-                        let (Some(id), Some(name), Some(description)) = (
-                            outcome["outcome"].as_u64(),
-                            outcome["name"].as_str(),
-                            outcome["description"].as_str(),
-                        ) else {
-                            continue;
-                        };
-                        if name != "template:binaryPrice" || !seen.insert(id) {
+                    for outcome in meta.outcomes {
+                        let id = u64::from(outcome.outcome);
+                        if outcome.name != "template:binaryPrice" || !seen.insert(id) {
                             continue;
                         }
-                        let venue = outcome["venue"].as_str().map(str::to_string);
-                        let market = match BinaryPrice::parse(id, name, description, venue) {
+                        let market = match BinaryPrice::parse(
+                            id,
+                            &outcome.name,
+                            &outcome.description,
+                            outcome.venue,
+                        ) {
                             Ok(market) => market,
                             Err(err) => {
                                 debug!(id, "skipping: {err:#}");
@@ -332,10 +310,8 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 .map(|(id, _)| *id)
                 .collect();
             for id in waiting {
-                let reply = match post(serde_json::json!({"type": "settledOutcome", "outcome": id}))
-                    .await
-                {
-                    Ok(reply) => reply,
+                let settled = match client.settled_outcome(id).await {
+                    Ok(settled) => settled,
                     Err(err) => {
                         debug!(id, "settledOutcome failed: {err:#}");
                         continue;
@@ -344,7 +320,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 let tracked_market = &tracked[&id];
                 let market = tracked_market.market.clone();
                 let (price, predicted_yes) = tracked_market.predicted.expect("predicted");
-                if reply.is_null() {
+                let Some(settled) = settled else {
                     if now > market.time_ms + GIVE_UP_MS {
                         stats.gave_up += 1;
                         let fields = Fields {
@@ -357,12 +333,9 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                         tracked.remove(&id);
                     }
                     continue;
-                }
-                let fraction: Decimal = reply["settleFraction"]
-                    .as_str()
-                    .context("settledOutcome without settleFraction")?
-                    .parse()?;
-                let actual_yes = fraction == Decimal::ONE;
+                };
+                // A binaryPrice outcome pays its first side, YES, in full or not at all.
+                let actual_yes = settled.settle_fraction == Decimal::ONE;
                 let lag_s = (now.saturating_sub(market.time_ms)) as f64 / 1000.0;
                 stats.settled += 1;
                 if actual_yes == predicted_yes {

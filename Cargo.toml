@@ -13,9 +13,9 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["now"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
-# Pinned to the hypersdk commit that merged trailing stops (#95); it includes the HIP-4
-# outcomeDeploy venue fix (#93), which no release has yet.
-hypersdk = { git = "https://github.com/infinitefield/hypersdk", rev = "23814557d0c3a8b929dc6ddc796bb9ed7484fae6" }
+# Pinned to the hypersdk commit that merged typed HIP-4 settlement (#97), which no release
+# has yet. It also has the outcomeDeploy venue fix (#93).
+hypersdk = { git = "https://github.com/infinitefield/hypersdk", rev = "2c8d9a8487fa972eb1b975eea294a38b7cb69582" }
 reqwest = { version = "0.13", features = ["json"] }
 rust_decimal = { version = "1.39", features = ["macros", "maths"] }
 serde = { version = "1", features = ["derive"] }
