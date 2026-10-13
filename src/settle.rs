@@ -4,6 +4,11 @@
 //! Mark and trade prices have no public history, so the keeper records them over the
 //! WebSocket from before each market's window opens. Candle-based markets are computed from
 //! `candleSnapshot` once the window closes.
+//!
+//! The templates say "TWAP" without saying how samples are weighted. Each prediction also
+//! logs the plain mean of the samples and, for trades, the VWAP, and every recorded window's
+//! raw samples go to a second log (`hip4-samples-*.jsonl`), so a disagreement with a venue
+//! can be replayed under other definitions.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -41,9 +46,20 @@ pub struct Options {
     pub out_dir: PathBuf,
 }
 
-/// Recorded prices per (coin, kind): `(ms since epoch, price)`, the last 15 minutes.
-type Samples = Arc<Mutex<HashMap<(String, PriceKind), VecDeque<(u64, Decimal)>>>>;
+/// One recorded price: when it happened (ms since epoch), the price, and a trade's size.
+#[derive(Clone, Copy)]
+struct Sample {
+    at: u64,
+    price: Decimal,
+    size: Option<Decimal>,
+}
+
+/// Recorded prices per (coin, kind), the last 15 minutes.
+type Samples = Arc<Mutex<HashMap<(String, PriceKind), VecDeque<Sample>>>>;
 const KEEP_MS: u64 = 15 * 60_000;
+/// Raw samples are saved from this long before a window opens, so other window boundaries
+/// can be tested later.
+const SAMPLE_MARGIN_MS: u64 = 30_000;
 /// How long after a window closes to predict, so late samples and the last candle arrive.
 const GRACE_MS: u64 = 10_000;
 /// Give up on a settlement this long after the window closes.
@@ -85,6 +101,25 @@ struct Row<'a> {
     actual_yes: Option<bool>,
     settle_lag_s: Option<f64>,
     note: Option<String>,
+    /// Plain mean of the window's samples, an alternative reading of "TWAP".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_price: Option<String>,
+    /// Volume-weighted average of the window's trades.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vwap_price: Option<String>,
+}
+
+/// One market's raw samples, as written to the samples log.
+#[derive(Serialize)]
+struct SamplesRow<'a> {
+    outcome: u64,
+    venue: Option<&'a str>,
+    coin: &'a str,
+    kind: String,
+    window_start_ms: u64,
+    expiry_ms: u64,
+    /// `[ms since epoch, price, size]`, with no size for marks.
+    samples: Vec<(u64, String, Option<String>)>,
 }
 
 fn now_ms() -> u64 {
@@ -98,18 +133,18 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     let client = HttpClient::new(network.chain());
 
     fs::create_dir_all(&options.out_dir)?;
-    let log_path = options.out_dir.join(format!(
-        "hip4-shadow-{}-{}.jsonl",
+    let stem = format!(
+        "{}-{}",
         match network {
             Network::Mainnet => "mainnet",
             Network::Testnet => "testnet",
         },
         chrono::Utc::now().format("%Y%m%d-%H%M")
-    ));
-    let mut log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    );
+    let log_path = options.out_dir.join(format!("hip4-shadow-{stem}.jsonl"));
+    let open = |path: &PathBuf| OpenOptions::new().create(true).append(true).open(path);
+    let mut log = open(&log_path)?;
+    let mut samples_log = open(&options.out_dir.join(format!("hip4-samples-{stem}.jsonl")))?;
 
     let samples: Samples = Arc::default();
     let ws = match network {
@@ -125,22 +160,32 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             };
             let now = now_ms();
             let mut map = recorder.lock().unwrap();
-            let mut push = |coin: String, kind: PriceKind, at: u64, price: Decimal| {
+            let mut push = |coin: String, kind: PriceKind, sample: Sample| {
                 let buffer = map.entry((coin, kind)).or_default();
-                buffer.push_back((at, price));
-                while buffer.front().is_some_and(|(t, _)| *t + KEEP_MS < now) {
+                buffer.push_back(sample);
+                while buffer.front().is_some_and(|s| s.at + KEEP_MS < now) {
                     buffer.pop_front();
                 }
             };
             match message {
                 Incoming::ActiveAssetCtx { coin, ctx } => {
                     if let Some(mark) = ctx.mark_px {
-                        push(coin, PriceKind::Mark, now, mark);
+                        let sample = Sample {
+                            at: now,
+                            price: mark,
+                            size: None,
+                        };
+                        push(coin, PriceKind::Mark, sample);
                     }
                 }
                 Incoming::Trades(trades) => {
                     for trade in trades {
-                        push(trade.coin, PriceKind::Trade, trade.time, trade.px);
+                        let sample = Sample {
+                            at: trade.time,
+                            price: trade.px,
+                            size: Some(trade.sz),
+                        };
+                        push(trade.coin, PriceKind::Trade, sample);
                     }
                 }
                 _ => {}
@@ -244,27 +289,35 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             .collect();
         for id in due {
             let market = tracked[&id].market.clone();
+            let (start, end) = (market.window_start_ms(), market.time_ms);
+            let (mut mean_price, mut vwap_price) = (None, None);
             let price = match market.kind {
                 PriceKind::Candle1m => client
-                    .candle_snapshot(
-                        market.coin.clone(),
-                        CandleInterval::OneMinute,
-                        market.window_start_ms(),
-                        market.time_ms,
-                    )
+                    .candle_snapshot(market.coin.clone(), CandleInterval::OneMinute, start, end)
                     .await
                     .ok()
                     .and_then(|candles| {
                         let closes: Vec<(u64, Decimal)> =
                             candles.iter().map(|c| (c.open_time, c.close)).collect();
-                        hip4::candle_twap(&closes, market.window_start_ms(), market.time_ms)
+                        hip4::candle_twap(&closes, start, end)
                     }),
                 kind => {
-                    let map = samples.lock().unwrap();
-                    map.get(&(market.coin.clone(), kind)).and_then(|buffer| {
-                        let buffer: Vec<(u64, Decimal)> = buffer.iter().copied().collect();
-                        hip4::step_twap(&buffer, market.window_start_ms(), market.time_ms)
-                    })
+                    let recorded: Vec<Sample> = samples
+                        .lock()
+                        .unwrap()
+                        .get(&(market.coin.clone(), kind))
+                        .map(|buffer| buffer.iter().copied().collect())
+                        .unwrap_or_default();
+                    write_samples(&mut samples_log, &market, &recorded)?;
+                    let points: Vec<(u64, Decimal)> =
+                        recorded.iter().map(|s| (s.at, s.price)).collect();
+                    let trades: Vec<(u64, Decimal, Decimal)> = recorded
+                        .iter()
+                        .filter_map(|s| Some((s.at, s.price, s.size?)))
+                        .collect();
+                    mean_price = hip4::sample_mean(&points, start, end);
+                    vwap_price = hip4::vwap(&trades, start, end);
+                    hip4::step_twap(&points, start, end)
                 }
             };
             let Some(price) = price else {
@@ -295,6 +348,8 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 price: Some(price),
                 predicted_yes: Some(yes),
                 margin_bps: Some(margin),
+                mean_price,
+                vwap_price,
                 ..Fields::default()
             };
             write(&mut log, &market, "predicted", fields)?;
@@ -381,9 +436,12 @@ struct Fields<'a> {
     actual_yes: Option<bool>,
     settle_lag_s: Option<f64>,
     note: Option<&'a str>,
+    mean_price: Option<Decimal>,
+    vwap_price: Option<Decimal>,
 }
 
 fn write(log: &mut fs::File, market: &BinaryPrice, event: &str, f: Fields) -> anyhow::Result<()> {
+    let px = |p: Decimal| p.round_dp(6).normalize().to_string();
     let row = Row {
         time: chrono::Utc::now().to_rfc3339(),
         event,
@@ -395,12 +453,44 @@ fn write(log: &mut fs::File, market: &BinaryPrice, event: &str, f: Fields) -> an
         expiry: chrono::DateTime::from_timestamp_millis(market.time_ms as i64)
             .map(|t| t.to_rfc3339())
             .unwrap_or_default(),
-        price: f.price.map(|p| p.round_dp(6).normalize().to_string()),
+        price: f.price.map(px),
         predicted_yes: f.predicted_yes,
         margin_bps: f.margin_bps.map(|m| (m * 100.0).round() / 100.0),
         actual_yes: f.actual_yes,
         settle_lag_s: f.settle_lag_s,
         note: f.note.map(str::to_string),
+        mean_price: f.mean_price.map(px),
+        vwap_price: f.vwap_price.map(px),
+    };
+    serde_json::to_writer(&mut *log, &row)?;
+    log.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Saves the samples a prediction was made from, from shortly before its window opened to
+/// now.
+fn write_samples(
+    log: &mut fs::File,
+    market: &BinaryPrice,
+    recorded: &[Sample],
+) -> anyhow::Result<()> {
+    let from = market.window_start_ms().saturating_sub(SAMPLE_MARGIN_MS);
+    // Keep the last sample before `from` too, so the price at that moment is known.
+    let first = recorded.iter().rposition(|s| s.at <= from).unwrap_or(0);
+    let row = SamplesRow {
+        outcome: market.outcome,
+        venue: market.venue.as_deref(),
+        coin: &market.coin,
+        kind: format!("{:?}", market.kind),
+        window_start_ms: market.window_start_ms(),
+        expiry_ms: market.time_ms,
+        samples: recorded[first..]
+            .iter()
+            .map(|s| {
+                let size = s.size.map(|z| z.normalize().to_string());
+                (s.at, s.price.normalize().to_string(), size)
+            })
+            .collect(),
     };
     serde_json::to_writer(&mut *log, &row)?;
     log.write_all(b"\n")?;

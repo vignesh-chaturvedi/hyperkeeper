@@ -116,6 +116,31 @@ pub fn step_twap(samples: &[(u64, Decimal)], start: u64, end: u64) -> Option<Dec
     Some(total / Decimal::from(end - start))
 }
 
+/// Plain mean of the samples timed in `[start, end)`, each counted once however long its
+/// price held. An alternative reading of "TWAP", kept to compare with the venues.
+pub fn sample_mean(samples: &[(u64, Decimal)], start: u64, end: u64) -> Option<Decimal> {
+    let prices: Vec<Decimal> = samples
+        .iter()
+        .filter(|(t, _)| *t >= start && *t < end)
+        .map(|(_, price)| *price)
+        .collect();
+    if prices.is_empty() {
+        return None;
+    }
+    Some(prices.iter().sum::<Decimal>() / Decimal::from(prices.len()))
+}
+
+/// Volume-weighted average price of the trades `(time, price, size)` in `[start, end)`.
+pub fn vwap(trades: &[(u64, Decimal, Decimal)], start: u64, end: u64) -> Option<Decimal> {
+    let (notional, volume) = trades
+        .iter()
+        .filter(|(t, _, _)| *t >= start && *t < end)
+        .fold((Decimal::ZERO, Decimal::ZERO), |(n, v), (_, px, sz)| {
+            (n + px * sz, v + sz)
+        });
+    (volume > Decimal::ZERO).then(|| notional / volume)
+}
+
 /// Mean of the closes of the 1-minute candles opening in `[start, end)`, with every minute
 /// present.
 pub fn candle_twap(candles: &[(u64, Decimal)], start: u64, end: u64) -> Option<Decimal> {
@@ -186,6 +211,26 @@ mod tests {
         // A window opening before the first sample is not covered.
         assert_eq!(step_twap(&samples, 0, 10_000), Some(dec!(90)));
         assert_eq!(step_twap(&samples[1..], 0, 10_000), None);
+    }
+
+    #[test]
+    fn the_three_averages_disagree_when_trading_is_uneven() {
+        // One trade at 100 opens the window, then a burst of three heavier trades at 90 in
+        // its last 10 s: over time the price was mostly 100; per trade and per unit it was 90.
+        let trades = [
+            (0, dec!(100), dec!(1)),
+            (50_000, dec!(90), dec!(2)),
+            (55_000, dec!(90), dec!(2)),
+            (58_000, dec!(90), dec!(2)),
+        ];
+        let points: Vec<(u64, Decimal)> = trades.iter().map(|(t, px, _)| (*t, *px)).collect();
+        let six = |p: Option<Decimal>| p.map(|p| p.round_dp(6));
+        assert_eq!(six(step_twap(&points, 0, 60_000)), Some(dec!(98.333333)));
+        assert_eq!(sample_mean(&points, 0, 60_000), Some(dec!(92.5)));
+        assert_eq!(six(vwap(&trades, 0, 60_000)), Some(dec!(91.428571)));
+        // Nothing traded in the window.
+        assert_eq!(sample_mean(&points, 60_000, 90_000), None);
+        assert_eq!(vwap(&trades, 60_000, 90_000), None);
     }
 
     #[test]

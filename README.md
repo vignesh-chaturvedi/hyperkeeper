@@ -13,7 +13,7 @@ HIP-3 and HIP-4 deployers run write-side jobs around the clock: a HIP-3 DEX must
 
 | What | Result | Report |
 |---|---|---|
-| HIP-4 settlement, 3 mainnet venues, Oct 8–9 | **369 of 369** outcomes predicted correctly, 12 of them within 2 bp of the threshold | [dry runs](reports/2026-10-09-dry-runs.md) |
+| HIP-4 settlement, 3 mainnet venues, Oct 8–13 | **1,863 of 1,866** outcomes predicted correctly; the 3 misses were within 2.7 bp of the threshold | [HIP-4 report](reports/2026-10-13-hip4.md) |
 | HIP-3 oracle, testnet `ignp`, 27 h | Within ~1 bp of the deployer's own oracle after USD conversion; no missed rounds | [shadow run](reports/2026-10-08-shadow-ignp.md) |
 | Failover rehearsal, 24.7 h | A standby would have covered 34 silences of the primary key, 14.2 min in all, the longest 96 s | [dry runs](reports/2026-10-09-dry-runs.md) |
 
@@ -99,7 +99,9 @@ A `binaryPrice` outcome settles YES if the `{seconds}`-second TWAP of the named 
 - from 1-minute candle closes, when the template names candles;
 - from mark prices or trades it records live, when it names those. There is no public history for them, so recording starts before each window opens.
 
-It then polls the venue's settlement and logs each prediction, the venue's result and the settle lag to `data/*.jsonl`.
+It then polls the venue's settlement and logs each prediction, the venue's result and the settle lag to `data/hip4-shadow-*.jsonl`.
+
+The templates say "TWAP" without saying how samples are weighted. So each prediction also logs the plain mean and, for trades, the volume-weighted average, and every recorded window's raw samples go to `data/hip4-samples-*.jsonl`. A disagreement with a venue can then be replayed under other definitions.
 
 ## Deploying
 
