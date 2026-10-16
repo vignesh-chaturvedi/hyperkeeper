@@ -1,8 +1,13 @@
-//! HIP-4 price-based outcomes: what a `binaryPrice` market should settle to.
+//! HIP-4 price-based outcomes: what a `binaryPrice` or `priceTouch` market should settle to.
 //!
-//! The template reads: the market resolves to Yes if the perp's price is above the
-//! threshold at the given time, "according to the {seconds}-second TWAP of
-//! {priceDescription} price ending at {time}". Venues use three price descriptions:
+//! Both templates settle on "the {seconds}-second TWAP of {priceDescription} price":
+//!
+//! - `binaryPrice` resolves to Yes if that TWAP, ending at {time}, is above the threshold.
+//! - `priceTouch` resolves to Yes as soon as that TWAP, taken over a rolling window, equals or
+//!   crosses the target at any time up to {time}, and to No if it never does.
+//!
+//! Testnet carries numbered drafts of the same templates (`binaryPrice6`, `priceTouch2`), which
+//! read the same way. Venues use three price descriptions:
 //!
 //! - `1-minute candle` (300 s): the mean of the 1-minute candle closes in the window. A
 //!   back-test of 35 settled mainnet markets on Oct 8, 2026 matched 35 of 35.
@@ -24,30 +29,46 @@ pub enum PriceKind {
     Trade,
 }
 
-/// A `binaryPrice` market, parsed from its `outcomeMeta` or `settledOutcome` description.
+/// How a market turns the TWAP into a result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rule {
+    /// `binaryPrice`: Yes if the TWAP ending at the market's time is above this threshold.
+    Above(Decimal),
+    /// `priceTouch`: Yes once a rolling TWAP equals or crosses this target, up to the
+    /// market's time.
+    Touch(Decimal),
+}
+
+/// A price-based market, parsed from its `outcomeMeta` or `settledOutcome` description.
 #[derive(Debug, Clone, PartialEq)]
-pub struct BinaryPrice {
+pub struct PriceMarket {
     pub outcome: u64,
     /// The perp's coin, e.g. `BTC` or `xyz:GOLD`.
     pub coin: String,
     pub kind: PriceKind,
     pub seconds: u64,
-    pub threshold: Decimal,
-    /// The window's end, in ms since the epoch.
+    pub rule: Rule,
+    /// The window's end, or for a touch market its deadline, in ms since the epoch.
     pub time_ms: u64,
     pub venue: Option<String>,
 }
 
-impl BinaryPrice {
-    /// Parses `perp:BTC|priceDescription:…|seconds:60|threshold:79422|time:20260904-1400`.
+impl PriceMarket {
+    /// Parses `perp:BTC|priceDescription:…|seconds:60|threshold:79422|time:20260904-1400`, or
+    /// the same with `target` for a touch market.
     pub fn parse(
         outcome: u64,
         name: &str,
         description: &str,
         venue: Option<String>,
     ) -> anyhow::Result<Self> {
-        if name != "template:binaryPrice" {
-            bail!("not a binaryPrice market: {name}");
+        let template = name
+            .strip_prefix("template:")
+            .with_context(|| format!("not a template market: {name}"))?;
+        // Testnet numbers its drafts of a template: binaryPrice4, binaryPrice6, priceTouch2.
+        let family = template.trim_end_matches(|c: char| c.is_ascii_digit());
+        if family != "binaryPrice" && family != "priceTouch" {
+            bail!("not a supported price template: {name}");
         }
         let fields: BTreeMap<&str, &str> = description
             .split('|')
@@ -70,6 +91,15 @@ impl BinaryPrice {
         } else {
             bail!("unknown price description: {description_of_price}");
         };
+        let rule = if family == "priceTouch" {
+            // A rolling candle TWAP would need a candle request every few seconds.
+            if kind == PriceKind::Candle1m {
+                bail!("touch markets on candles are not supported: {description}");
+            }
+            Rule::Touch(field("target")?.parse()?)
+        } else {
+            Rule::Above(field("threshold")?.parse()?)
+        };
         let time = NaiveDateTime::parse_from_str(field("time")?, "%Y%m%d-%H%M")
             .with_context(|| format!("bad time in {description}"))?;
         Ok(Self {
@@ -77,7 +107,7 @@ impl BinaryPrice {
             coin,
             kind,
             seconds: field("seconds")?.parse()?,
-            threshold: field("threshold")?.parse()?,
+            rule,
             time_ms: time.and_utc().timestamp_millis() as u64,
             venue,
         })
@@ -85,6 +115,13 @@ impl BinaryPrice {
 
     pub fn window_start_ms(&self) -> u64 {
         self.time_ms.saturating_sub(self.seconds * 1000)
+    }
+
+    /// The threshold or target the TWAP is compared with.
+    pub fn level(&self) -> Decimal {
+        match self.rule {
+            Rule::Above(level) | Rule::Touch(level) => level,
+        }
     }
 }
 
@@ -141,6 +178,41 @@ pub fn vwap(trades: &[(u64, Decimal, Decimal)], start: u64, end: u64) -> Option<
     (volume > Decimal::ZERO).then(|| notional / volume)
 }
 
+/// The first moment in `(from, to]` at which the `seconds`-second TWAP ending then reaches
+/// `target` from the side it started on: from below means at or above the target, from above
+/// means at or below it.
+///
+/// Between the moments a sample enters or leaves the window, the TWAP of a step function moves
+/// in a straight line, so checking those moments finds every touch. The time returned can be
+/// up to one such step after the exact crossing.
+pub fn first_touch(
+    samples: &[(u64, Decimal)],
+    seconds: u64,
+    target: Decimal,
+    from_below: bool,
+    from: u64,
+    to: u64,
+) -> Option<u64> {
+    let window = seconds * 1000;
+    let mut ends: Vec<u64> = samples
+        .iter()
+        .flat_map(|(t, _)| [*t, t + window])
+        .chain([to])
+        .filter(|end| *end > from && *end <= to)
+        .collect();
+    ends.sort_unstable();
+    ends.dedup();
+    ends.into_iter().find(|end| {
+        step_twap(samples, end.saturating_sub(window), *end).is_some_and(|twap| {
+            if from_below {
+                twap >= target
+            } else {
+                twap <= target
+            }
+        })
+    })
+}
+
 /// Mean of the closes of the 1-minute candles opening in `[start, end)`, with every minute
 /// present.
 pub fn candle_twap(candles: &[(u64, Decimal)], start: u64, end: u64) -> Option<Decimal> {
@@ -164,7 +236,7 @@ mod tests {
 
     #[test]
     fn parses_the_three_price_descriptions() {
-        let candle = BinaryPrice::parse(
+        let candle = PriceMarket::parse(
             7349,
             "template:binaryPrice",
             "perp:HYPE|priceDescription:1-minute candle|seconds:300|threshold:98|time:20261030-2000",
@@ -173,11 +245,11 @@ mod tests {
         .unwrap();
         assert_eq!(candle.kind, PriceKind::Candle1m);
         assert_eq!(candle.coin, "HYPE");
-        assert_eq!(candle.threshold, dec!(98));
+        assert_eq!(candle.rule, Rule::Above(dec!(98)));
         assert_eq!(candle.time_ms, 1_793_390_400_000);
         assert_eq!(candle.window_start_ms(), 1_793_390_100_000);
 
-        let mark = BinaryPrice::parse(
+        let mark = PriceMarket::parse(
             1,
             "template:binaryPrice",
             "perp:xyz:GOLD|priceDescription:xyz:GOLD-USDC perp mark|seconds:60|threshold:4090|time:20261007-2000",
@@ -189,7 +261,7 @@ mod tests {
             (PriceKind::Mark, "xyz:GOLD")
         );
 
-        let trade = BinaryPrice::parse(
+        let trade = PriceMarket::parse(
             1471,
             "template:binaryPrice",
             "perp:BTC|priceDescription:the Hyperliquid BTC perp trade|seconds:90|threshold:79422|time:20260904-1400",
@@ -198,7 +270,61 @@ mod tests {
         .unwrap();
         assert_eq!((trade.kind, trade.seconds), (PriceKind::Trade, 90));
 
-        assert!(BinaryPrice::parse(1, "template:priceTouch", "perp:BTC", None).is_err());
+        assert!(PriceMarket::parse(1, "template:priceTouch", "perp:BTC", None).is_err());
+        assert!(PriceMarket::parse(1, "template:binaryPriceExternal", "perp:BTC", None).is_err());
+    }
+
+    #[test]
+    fn parses_touch_markets_and_testnet_drafts() {
+        // Mainnet outcome 7175 on Outcome's venue.
+        let touch = PriceMarket::parse(
+            7175,
+            "template:priceTouch",
+            "perp:BTC|priceDescription:BTC-USDC perp mark|seconds:3|target:92500|time:20261101-0000",
+            Some("out".into()),
+        )
+        .unwrap();
+        assert_eq!(touch.rule, Rule::Touch(dec!(92500)));
+        assert_eq!((touch.kind, touch.seconds), (PriceKind::Mark, 3));
+        assert_eq!(touch.level(), dec!(92500));
+
+        let draft = PriceMarket::parse(
+            1,
+            "template:binaryPrice6",
+            "perp:BTC|priceDescription:the Hyperliquid BTC perp trade|seconds:90|threshold:84912|time:20261020-1200",
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.rule, Rule::Above(dec!(84912)));
+    }
+
+    #[test]
+    fn first_touch_finds_the_moment_a_rolling_twap_reaches_the_target() {
+        // One-second marks climbing through 100: 98, 99, 100, 101 from t = 0 s.
+        let marks = [
+            (0, dec!(98)),
+            (1_000, dec!(99)),
+            (2_000, dec!(100)),
+            (3_000, dec!(101)),
+        ];
+        // The 3 s TWAP ending at 5 s is (100 + 101 + 101) / 3 = 100.67, at 4 s it is
+        // (99 + 100 + 101) / 3 = 100, which already counts as a touch.
+        assert_eq!(
+            first_touch(&marks, 3, dec!(100), true, 0, 10_000),
+            Some(4_000)
+        );
+        // A higher target is never reached while the price sits at 101.
+        assert_eq!(first_touch(&marks, 3, dec!(102), true, 0, 10_000), None);
+        // From above, a target of 98.5 is never reached either: the price only rose.
+        assert_eq!(
+            first_touch(&marks, 3, dec!(98.5), false, 3_000, 10_000),
+            None
+        );
+        // Only window ends after `from` count.
+        assert_eq!(
+            first_touch(&marks, 3, dec!(100), true, 4_000, 10_000),
+            Some(5_000)
+        );
     }
 
     #[test]

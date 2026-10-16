@@ -1,9 +1,11 @@
-//! HIP-4 shadow settlement: predict what each `binaryPrice` market settles to, then check
-//! the prediction against the venue's actual settlement. Sends nothing.
+//! HIP-4 shadow settlement: predict what each `binaryPrice` and `priceTouch` market settles
+//! to, then check the prediction against the venue's actual settlement. Sends nothing.
 //!
 //! Mark and trade prices have no public history, so the keeper records them over the
 //! WebSocket from before each market's window opens. Candle-based markets are computed from
-//! `candleSnapshot` once the window closes.
+//! `candleSnapshot` once the window closes. A touch market can settle any time before its
+//! deadline, so it is watched from when it is first seen: its rolling TWAP is checked every
+//! few seconds, and the prediction is Yes the moment it reaches the target.
 //!
 //! The templates say "TWAP" without saying how samples are weighted. Each prediction also
 //! logs the plain mean of the samples and, for trades, the VWAP, and every recorded window's
@@ -33,7 +35,7 @@ use tracing::{debug, info, warn};
 use crate::{
     aggregate::deviation_bps,
     config::Network,
-    hip4::{self, BinaryPrice, PriceKind},
+    hip4::{self, PriceKind, PriceMarket, Rule},
 };
 
 pub struct Options {
@@ -68,8 +70,14 @@ const GIVE_UP_MS: u64 = 24 * 3_600_000;
 const CLOSE_CALL_BPS: f64 = 2.0;
 
 struct Tracked {
-    market: BinaryPrice,
+    market: PriceMarket,
     predicted: Option<(Decimal, bool)>,
+    /// For a touch market: whether its TWAP started below the target, once known.
+    from_below: Option<bool>,
+    /// For a touch market: window ends up to here have been checked for a touch.
+    checked_to: u64,
+    /// For a touch market: when its TWAP first reached the target.
+    touched_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -93,6 +101,9 @@ struct Row<'a> {
     venue: Option<&'a str>,
     coin: &'a str,
     kind: String,
+    /// `above` for `binaryPrice`, `touch` for `priceTouch`.
+    rule: &'static str,
+    /// The threshold, or a touch market's target.
     threshold: String,
     expiry: String,
     price: Option<String>,
@@ -107,6 +118,9 @@ struct Row<'a> {
     /// Volume-weighted average of the window's trades.
     #[serde(skip_serializing_if = "Option::is_none")]
     vwap_price: Option<String>,
+    /// When a touch market's TWAP first reached its target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    touched_at: Option<String>,
 }
 
 /// One market's raw samples, as written to the samples log.
@@ -117,7 +131,7 @@ struct SamplesRow<'a> {
     coin: &'a str,
     kind: String,
     window_start_ms: u64,
-    expiry_ms: u64,
+    window_end_ms: u64,
     /// `[ms since epoch, price, size]`, with no size for marks.
     samples: Vec<(u64, String, Option<String>)>,
 }
@@ -196,7 +210,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     info!(
         ?network,
         log = %log_path.display(),
-        "HIP-4 shadow settlement: predicting binaryPrice markets and checking them against the venues; nothing is sent"
+        "HIP-4 shadow settlement: predicting binaryPrice and priceTouch markets and checking them against the venues; nothing is sent"
     );
 
     let mut tracked: BTreeMap<u64, Tracked> = BTreeMap::new();
@@ -225,17 +239,17 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         }
         let now = now_ms();
 
-        // Follow markets whose window closes within the lookahead.
+        // Follow markets whose window closes within the lookahead, and every touch market.
         if last_refresh.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
             last_refresh = Some(Instant::now());
             match client.outcome_meta().await {
                 Ok(meta) => {
                     for outcome in meta.outcomes {
                         let id = u64::from(outcome.outcome);
-                        if outcome.name != "template:binaryPrice" || !seen.insert(id) {
+                        if !outcome.name.starts_with("template:") || !seen.insert(id) {
                             continue;
                         }
-                        let market = match BinaryPrice::parse(
+                        let market = match PriceMarket::parse(
                             id,
                             &outcome.name,
                             &outcome.description,
@@ -248,15 +262,31 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                             }
                         };
                         // A live-recorded market is only predictable if recording started
-                        // before its window opened.
+                        // before its window opened. A touch market is watched from now until
+                        // its deadline instead.
+                        let touch = matches!(market.rule, Rule::Touch(_));
                         let recordable = market.kind == PriceKind::Candle1m
+                            || touch
                             || market.window_start_ms() > started_ms;
                         if market.time_ms + GRACE_MS < now
-                            || market.time_ms > now + lookahead_ms
+                            || (!touch && market.time_ms > now + lookahead_ms)
                             || !recordable
                         {
                             seen.remove(&id);
                             continue;
+                        }
+                        // A touch market that settled before hyperkeeper saw it can't be
+                        // checked.
+                        if touch {
+                            match client.settled_outcome(id).await {
+                                Ok(None) => {}
+                                Ok(Some(_)) => continue,
+                                Err(err) => {
+                                    debug!(id, "settledOutcome failed: {err:#}");
+                                    seen.remove(&id);
+                                    continue;
+                                }
+                            }
                         }
                         if market.kind != PriceKind::Candle1m {
                             let key = (market.coin.clone(), market.kind);
@@ -273,6 +303,9 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                             Tracked {
                                 market,
                                 predicted: None,
+                                from_below: None,
+                                checked_to: now,
+                                touched_at: None,
                             },
                         );
                     }
@@ -281,15 +314,61 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             }
         }
 
-        // Predict each market once its window has closed.
+        // Watch each touch market for the first moment its TWAP reaches the target.
+        for (id, t) in tracked.iter_mut() {
+            let Rule::Touch(target) = t.market.rule else {
+                continue;
+            };
+            if t.predicted.is_some() || t.touched_at.is_some() {
+                continue;
+            }
+            let points: Vec<(u64, Decimal)> = samples
+                .lock()
+                .unwrap()
+                .get(&(t.market.coin.clone(), t.market.kind))
+                .map(|buffer| buffer.iter().map(|s| (s.at, s.price)).collect())
+                .unwrap_or_default();
+            let to = now.min(t.market.time_ms);
+            let window = t.market.seconds * 1000;
+            let Some(from_below) = t.from_below else {
+                // The side of the target the first full window lands on.
+                if let Some(twap) = hip4::step_twap(&points, to.saturating_sub(window), to) {
+                    let side = if twap < target { "below" } else { "above" };
+                    info!(id, coin = %t.market.coin, %target, %twap, "watching for a touch from {side}");
+                    t.from_below = Some(twap < target);
+                }
+                t.checked_to = to;
+                continue;
+            };
+            t.touched_at = hip4::first_touch(
+                &points,
+                t.market.seconds,
+                target,
+                from_below,
+                t.checked_to,
+                to,
+            );
+            if let Some(at) = t.touched_at {
+                info!(id, coin = %t.market.coin, %target, touched_at = %rfc3339(at), "touched");
+            }
+            t.checked_to = to;
+        }
+
+        // Predict each market once its window has closed, or a touch market once it touched.
         let due: Vec<u64> = tracked
             .iter()
-            .filter(|(_, t)| t.predicted.is_none() && now >= t.market.time_ms + GRACE_MS)
+            .filter(|(_, t)| {
+                t.predicted.is_none()
+                    && (t.touched_at.is_some() || now >= t.market.time_ms + GRACE_MS)
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in due {
             let market = tracked[&id].market.clone();
-            let (start, end) = (market.window_start_ms(), market.time_ms);
+            let touched_at = tracked[&id].touched_at;
+            // A touch market is judged on the window that touched, or else on its last one.
+            let end = touched_at.unwrap_or(market.time_ms);
+            let start = end.saturating_sub(market.seconds * 1000);
             let (mut mean_price, mut vwap_price) = (None, None);
             let price = match market.kind {
                 PriceKind::Candle1m => client
@@ -308,7 +387,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                         .get(&(market.coin.clone(), kind))
                         .map(|buffer| buffer.iter().copied().collect())
                         .unwrap_or_default();
-                    write_samples(&mut samples_log, &market, &recorded)?;
+                    write_samples(&mut samples_log, &market, start, end, &recorded)?;
                     let points: Vec<(u64, Decimal)> =
                         recorded.iter().map(|s| (s.at, s.price)).collect();
                     let trades: Vec<(u64, Decimal, Decimal)> = recorded
@@ -335,11 +414,14 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 tracked.remove(&id);
                 continue;
             };
-            let yes = hip4::resolves_yes(price, market.threshold);
-            let margin = deviation_bps(price, market.threshold)
+            let yes = match market.rule {
+                Rule::Above(threshold) => hip4::resolves_yes(price, threshold),
+                Rule::Touch(_) => touched_at.is_some(),
+            };
+            let margin = deviation_bps(price, market.level())
                 .to_f64()
                 .unwrap_or(f64::NAN);
-            if margin.abs() < CLOSE_CALL_BPS {
+            if matches!(market.rule, Rule::Above(_)) && margin.abs() < CLOSE_CALL_BPS {
                 stats.close_calls += 1;
             }
             stats.predicted += 1;
@@ -350,6 +432,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 margin_bps: Some(margin),
                 mean_price,
                 vwap_price,
+                touched_at,
                 ..Fields::default()
             };
             write(&mut log, &market, "predicted", fields)?;
@@ -359,9 +442,11 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         // Check predictions against the venues' settlements.
         if last_settle_check.elapsed() >= Duration::from_secs(30) {
             last_settle_check = Instant::now();
+            // Touch markets are checked before any prediction too, to catch a touch the venue
+            // saw and hyperkeeper didn't.
             let waiting: Vec<u64> = tracked
                 .iter()
-                .filter(|(_, t)| t.predicted.is_some())
+                .filter(|(_, t)| t.predicted.is_some() || matches!(t.market.rule, Rule::Touch(_)))
                 .map(|(id, _)| *id)
                 .collect();
             for id in waiting {
@@ -374,9 +459,14 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 };
                 let tracked_market = &tracked[&id];
                 let market = tracked_market.market.clone();
-                let (price, predicted_yes) = tracked_market.predicted.expect("predicted");
+                let predicted = tracked_market.predicted;
+                let touched_at = tracked_market.touched_at;
+                // Lag counts from when the result was known: the expiry, or the touch.
+                let known_at = touched_at.unwrap_or(market.time_ms);
                 let Some(settled) = settled else {
-                    if now > market.time_ms + GIVE_UP_MS {
+                    if let Some((price, predicted_yes)) = predicted
+                        && now > known_at + GIVE_UP_MS
+                    {
                         stats.gave_up += 1;
                         let fields = Fields {
                             price: Some(price),
@@ -389,26 +479,43 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                     }
                     continue;
                 };
-                // A binaryPrice outcome pays its first side, YES, in full or not at all.
+                // These outcomes pay their first side, YES, in full or not at all.
                 let actual_yes = settled.settle_fraction == Decimal::ONE;
-                let lag_s = (now.saturating_sub(market.time_ms)) as f64 / 1000.0;
                 stats.settled += 1;
+                let Some((price, predicted_yes)) = predicted else {
+                    // Only a touch market gets here: the venue settled it before hyperkeeper
+                    // saw its TWAP reach the target.
+                    stats.mismatched.push(id);
+                    let target = market.level();
+                    warn!(id, coin = %market.coin, %target, actual_yes, "settled before hyperkeeper saw a touch");
+                    let fields = Fields {
+                        actual_yes: Some(actual_yes),
+                        note: Some("settled before hyperkeeper saw a touch"),
+                        ..Fields::default()
+                    };
+                    write(&mut log, &market, "settled", fields)?;
+                    tracked.remove(&id);
+                    continue;
+                };
+                let lag_s = (now.saturating_sub(known_at)) as f64 / 1000.0;
                 if actual_yes == predicted_yes {
                     stats.matched += 1;
                 } else {
                     stats.mismatched.push(id);
-                    warn!(id, coin = %market.coin, %price, threshold = %market.threshold, predicted_yes, actual_yes, "MISMATCH");
+                    let level = market.level();
+                    warn!(id, coin = %market.coin, %price, %level, predicted_yes, actual_yes, "MISMATCH");
                 }
-                stats
-                    .settle_lag
-                    .entry(market.venue.clone().unwrap_or_else(|| "protocol".into()))
-                    .or_default()
-                    .push(lag_s);
+                let mut bucket = market.venue.clone().unwrap_or_else(|| "protocol".into());
+                if matches!(market.rule, Rule::Touch(_)) {
+                    bucket.push_str(" touch");
+                }
+                stats.settle_lag.entry(bucket).or_default().push(lag_s);
                 let fields = Fields {
                     price: Some(price),
                     predicted_yes: Some(predicted_yes),
                     actual_yes: Some(actual_yes),
                     settle_lag_s: Some(lag_s),
+                    touched_at,
                     ..Fields::default()
                 };
                 write(&mut log, &market, "settled", fields)?;
@@ -438,9 +545,17 @@ struct Fields<'a> {
     note: Option<&'a str>,
     mean_price: Option<Decimal>,
     vwap_price: Option<Decimal>,
+    touched_at: Option<u64>,
 }
 
-fn write(log: &mut fs::File, market: &BinaryPrice, event: &str, f: Fields) -> anyhow::Result<()> {
+/// Milliseconds since the epoch as an RFC 3339 time.
+fn rfc3339(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn write(log: &mut fs::File, market: &PriceMarket, event: &str, f: Fields) -> anyhow::Result<()> {
     let px = |p: Decimal| p.round_dp(6).normalize().to_string();
     let row = Row {
         time: chrono::Utc::now().to_rfc3339(),
@@ -449,10 +564,12 @@ fn write(log: &mut fs::File, market: &BinaryPrice, event: &str, f: Fields) -> an
         venue: market.venue.as_deref(),
         coin: &market.coin,
         kind: format!("{:?}", market.kind),
-        threshold: market.threshold.normalize().to_string(),
-        expiry: chrono::DateTime::from_timestamp_millis(market.time_ms as i64)
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_default(),
+        rule: match market.rule {
+            Rule::Above(_) => "above",
+            Rule::Touch(_) => "touch",
+        },
+        threshold: market.level().normalize().to_string(),
+        expiry: rfc3339(market.time_ms),
         price: f.price.map(px),
         predicted_yes: f.predicted_yes,
         margin_bps: f.margin_bps.map(|m| (m * 100.0).round() / 100.0),
@@ -461,6 +578,7 @@ fn write(log: &mut fs::File, market: &BinaryPrice, event: &str, f: Fields) -> an
         note: f.note.map(str::to_string),
         mean_price: f.mean_price.map(px),
         vwap_price: f.vwap_price.map(px),
+        touched_at: f.touched_at.map(rfc3339),
     };
     serde_json::to_writer(&mut *log, &row)?;
     log.write_all(b"\n")?;
@@ -471,10 +589,12 @@ fn write(log: &mut fs::File, market: &BinaryPrice, event: &str, f: Fields) -> an
 /// now.
 fn write_samples(
     log: &mut fs::File,
-    market: &BinaryPrice,
+    market: &PriceMarket,
+    start: u64,
+    end: u64,
     recorded: &[Sample],
 ) -> anyhow::Result<()> {
-    let from = market.window_start_ms().saturating_sub(SAMPLE_MARGIN_MS);
+    let from = start.saturating_sub(SAMPLE_MARGIN_MS);
     // Keep the last sample before `from` too, so the price at that moment is known.
     let first = recorded.iter().rposition(|s| s.at <= from).unwrap_or(0);
     let row = SamplesRow {
@@ -482,8 +602,8 @@ fn write_samples(
         venue: market.venue.as_deref(),
         coin: &market.coin,
         kind: format!("{:?}", market.kind),
-        window_start_ms: market.window_start_ms(),
-        expiry_ms: market.time_ms,
+        window_start_ms: start,
+        window_end_ms: end,
         samples: recorded[first..]
             .iter()
             .map(|s| {

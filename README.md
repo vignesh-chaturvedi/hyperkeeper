@@ -5,7 +5,7 @@ Open-source operations for Hyperliquid deployers, in Rust on [hypersdk](https://
 HIP-3 and HIP-4 deployers run write-side jobs around the clock: a HIP-3 DEX must update its oracle every 3 seconds, and a HIP-4 venue must settle every outcome it lists. A deployer can hand that work to a sub-deployer key that holds only the one permission it needs, without giving up the stake. hyperkeeper is the process that holds that key.
 
 - **HIP-3 oracle.** Prices every asset from several public venues every 3 seconds and sends `setOracle`, or `star.setOracle` on HIP-3\* venues. Two instances with separate keys fail over to each other.
-- **HIP-4 settlement.** Computes what each `binaryPrice` outcome settles to from the price its template names, seconds after the window closes.
+- **HIP-4 settlement.** Computes what each `binaryPrice` and `priceTouch` outcome settles to from the price its template names, seconds after the window closes or the target is touched.
 
 **Status: pre-release, testnet.** Everything up to the send is built and tested. Sending needs a deployer to grant a key; until then hyperkeeper runs in shadow and dry-run modes, which sign but send nothing that can take effect.
 
@@ -25,7 +25,7 @@ HIP-3 and HIP-4 deployers run write-side jobs around the clock: a HIP-3 DEX must
 | `shadow` | Every 3 s: prices the DEX, builds and signs the oracle update, and compares it with the DEX's live oracle. Writes every tick to `data/*.jsonl`. | Nothing |
 | `run --dry-run` | Everything `run` does except the send, including failover decisions | Nothing |
 | `run` | Sends the oracle update every 3 s, as a primary or a standby | A key the DEX has granted `setOracle` |
-| `hip4-shadow` | Follows every `binaryPrice` market, predicts its settlement at expiry, and checks it against the venue's | Nothing |
+| `hip4-shadow` | Follows every `binaryPrice` and `priceTouch` market, predicts its settlement, and checks it against the venue's | Nothing |
 
 ## Quick start
 
@@ -99,7 +99,11 @@ A `binaryPrice` outcome settles YES if the `{seconds}`-second TWAP of the named 
 - from 1-minute candle closes, when the template names candles;
 - from mark prices or trades it records live, when it names those. There is no public history for them, so recording starts before each window opens.
 
-It then polls the venue's settlement and logs each prediction, the venue's result and the settle lag to `data/hip4-shadow-*.jsonl`.
+A `priceTouch` outcome settles YES as soon as the `{seconds}`-second TWAP equals or crosses the target, at any time up to `{time}`, and NO if it never does. `hip4-shadow` watches each one from when it first sees it: every few seconds it checks the rolling TWAP, and predicts YES the moment it reaches the target. Between the moments a sample enters or leaves the window, that TWAP moves in a straight line, so checking those moments finds every touch. If the venue settles a touch that hyperkeeper didn't see, it counts as a miss.
+
+It then polls the venue's settlement and logs each prediction, the venue's result and the settle lag to `data/hip4-shadow-*.jsonl`. For a touch, the lag counts from the touch.
+
+Testnet also lists numbered drafts of these templates, such as `binaryPrice6` and `priceTouch2`. They read the same way and are handled the same. `scalarPrice` and `binaryPriceExternal` are not supported yet.
 
 The templates say "TWAP" without saying how samples are weighted. So each prediction also logs the plain mean and, for trades, the volume-weighted average, and every recorded window's raw samples go to `data/hip4-samples-*.jsonl`. A disagreement with a venue can then be replayed under other definitions.
 
