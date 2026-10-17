@@ -1,0 +1,121 @@
+# Shadow-mode config for trade[XYZ]'s HIP-3 DEX (`xyz` on mainnet): price its most-traded
+# stocks, two metals and two currencies, and compare with the oracle its deployer publishes.
+#
+# trade[XYZ] publishes an external price while the underlying trades (24/5 for US stocks,
+# 23/5 for metals, 24/5 for FX) and moves its oracle with its own order book otherwise.
+# Pyth's US stock feeds cover regular hours, and xStocks trade around the clock at a premium
+# to the stock outside regular hours, so compare each source separately (`quotes` in the
+# log) and expect the closest match while the US market is open.
+#
+# The pyth source needs HYPERKEEPER_PYTH_API_KEY. Without it, only xStocks price. A key's
+# plan may cover only some feeds (Pyth's demo plan: TSLA, gold, silver, EUR/USD, USD/JPY);
+# hyperkeeper learns which from Pyth's errors and leaves the others to xStocks.
+network = "mainnet"
+dex = "xyz"
+star = false
+interval_ms = 3000
+
+[sources]
+spot = ["pyth", "bybit-xstock"]
+perp = []
+max_age_ms = 10000
+min_sources = 1
+max_deviation_bps = 100
+convention = "usd"
+
+[guards]
+max_move_bps = 200
+unsent_alarm_ticks = 3
+
+# Stocks with both a Pyth feed and an xStock, by trade[XYZ] volume on Oct 16, 2026.
+[[asset]]
+coin = "xyz:NVDA"
+symbol = "NVDA"
+pyth = "Equity.US.NVDA/USD"
+
+[[asset]]
+coin = "xyz:TSLA"
+symbol = "TSLA"
+pyth = "Equity.US.TSLA/USD"
+
+[[asset]]
+coin = "xyz:CRCL"
+symbol = "CRCL"
+pyth = "Equity.US.CRCL/USD"
+
+[[asset]]
+coin = "xyz:GOOGL"
+symbol = "GOOGL"
+pyth = "Equity.US.GOOGL/USD"
+
+[[asset]]
+coin = "xyz:META"
+symbol = "META"
+pyth = "Equity.US.META/USD"
+
+[[asset]]
+coin = "xyz:AAPL"
+symbol = "AAPL"
+pyth = "Equity.US.AAPL/USD"
+
+[[asset]]
+coin = "xyz:AMZN"
+symbol = "AMZN"
+pyth = "Equity.US.AMZN/USD"
+
+[[asset]]
+coin = "xyz:HOOD"
+symbol = "HOOD"
+pyth = "Equity.US.HOOD/USD"
+
+[[asset]]
+coin = "xyz:COIN"
+symbol = "COIN"
+pyth = "Equity.US.COIN/USD"
+
+# Heavily traded stocks with a Pyth feed but no xStock.
+[[asset]]
+coin = "xyz:MU"
+symbol = "MU"
+pyth = "Equity.US.MU/USD"
+
+[[asset]]
+coin = "xyz:SNDK"
+symbol = "SNDK"
+pyth = "Equity.US.SNDK/USD"
+
+[[asset]]
+coin = "xyz:INTC"
+symbol = "INTC"
+pyth = "Equity.US.INTC/USD"
+
+[[asset]]
+coin = "xyz:AMD"
+symbol = "AMD"
+pyth = "Equity.US.AMD/USD"
+
+[[asset]]
+coin = "xyz:MSTR"
+symbol = "MSTR"
+pyth = "Equity.US.MSTR/USD"
+
+# Metals and currencies.
+[[asset]]
+coin = "xyz:GOLD"
+symbol = "GOLD"
+pyth = "Metal.XAU/USD"
+
+[[asset]]
+coin = "xyz:SILVER"
+symbol = "SILVER"
+pyth = "Metal.XAG/USD"
+
+[[asset]]
+coin = "xyz:EUR"
+symbol = "EUR"
+pyth = "FX.EUR/USD"
+
+[[asset]]
+coin = "xyz:JPY"
+symbol = "JPY"
+pyth = "FX.USD/JPY"

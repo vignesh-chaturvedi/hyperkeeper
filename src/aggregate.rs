@@ -11,6 +11,8 @@ pub struct Aggregate {
     pub used: Vec<SourceKind>,
     /// Sources dropped for sitting too far from the median, with their quote.
     pub outliers: Vec<(SourceKind, Decimal)>,
+    /// Every quote considered, so each source can be compared on its own later.
+    pub quotes: Vec<(SourceKind, Decimal)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +70,7 @@ pub fn aggregate(
         price,
         used: agree.into_iter().map(|(source, _)| source).collect(),
         outliers,
+        quotes: quotes.to_vec(),
     })
 }
 

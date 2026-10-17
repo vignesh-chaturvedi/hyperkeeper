@@ -127,6 +127,9 @@ pub struct Asset {
     pub coin: String,
     /// Underlying symbol looked up on every source, e.g. `BTC`.
     pub symbol: String,
+    /// The asset's Pyth feed, e.g. `Equity.US.NVDA/USD`. Only the `pyth` source reads it.
+    #[serde(default)]
+    pub pyth: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +195,12 @@ pub enum SourceKind {
     OkxPerp,
     /// Mid price of the same coin's perp on Hyperliquid's main DEX (mainnet).
     HyperliquidPerp,
+    /// Pyth price feeds, named per asset with `pyth = "..."`. Covers stocks, metals and FX,
+    /// and needs an API key in `HYPERKEEPER_PYTH_API_KEY`.
+    Pyth,
+    /// Bybit's tokenized stocks (xStocks), e.g. `NVDAXUSDT` for `NVDA`. They trade around the
+    /// clock, at a premium to the stock outside its trading sessions.
+    BybitXstock,
 }
 
 impl SourceKind {
@@ -207,6 +216,8 @@ impl SourceKind {
             SourceKind::BybitPerp => "bybit-perp",
             SourceKind::OkxPerp => "okx-perp",
             SourceKind::HyperliquidPerp => "hyperliquid-perp",
+            SourceKind::Pyth => "pyth",
+            SourceKind::BybitXstock => "bybit-xstock",
         }
     }
 
@@ -217,7 +228,7 @@ impl SourceKind {
     /// USD-quoted venues while USDT traded 7.2 bp under a dollar.
     pub fn quote(self) -> Quote {
         match self {
-            SourceKind::Coinbase | SourceKind::Kraken => Quote::Usd,
+            SourceKind::Coinbase | SourceKind::Kraken | SourceKind::Pyth => Quote::Usd,
             SourceKind::Binance
             | SourceKind::Bybit
             | SourceKind::Okx
@@ -225,7 +236,8 @@ impl SourceKind {
             | SourceKind::BybitPerp
             | SourceKind::OkxPerp
             | SourceKind::HyperliquidOracle
-            | SourceKind::HyperliquidPerp => Quote::Usdt,
+            | SourceKind::HyperliquidPerp
+            | SourceKind::BybitXstock => Quote::Usdt,
         }
     }
 }
@@ -286,6 +298,11 @@ impl Config {
         if self.sources.spot.is_empty() {
             bail!("sources.spot is empty");
         }
+        let uses_pyth = self.sources.spot.contains(&SourceKind::Pyth)
+            || self.sources.perp.contains(&SourceKind::Pyth);
+        if uses_pyth && self.assets.iter().all(|a| a.pyth.is_none()) {
+            bail!("sources include pyth, but no [[asset]] names a pyth feed");
+        }
         if self.sources.min_sources == 0 {
             bail!("sources.min_sources must be at least 1");
         }
@@ -327,6 +344,15 @@ mod tests {
         let mut config: Config = toml::from_str(EXAMPLE).unwrap();
         config.interval_ms = 2_000;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pyth_needs_a_feed_on_some_asset() {
+        let mut config: Config = toml::from_str(EXAMPLE).unwrap();
+        config.sources.spot.push(SourceKind::Pyth);
+        assert!(config.validate().is_err());
+        config.assets[0].pyth = Some("Crypto.BTC/USD".into());
+        config.validate().unwrap();
     }
 
     #[test]

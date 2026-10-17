@@ -90,7 +90,12 @@ When the primary recovers, both instances may send until the standby's next poll
 4. The external perp price is the same over perp sources, falling back to the oracle price.
 5. Lists are sorted by coin and prices rounded to `6 - szDecimals` decimals.
 
-Sources: Binance, Coinbase, Bybit, Kraken and OKX spot; Binance, Bybit and OKX perps; Hyperliquid's own oracle and perp mids.
+Sources: Binance, Coinbase, Bybit, Kraken and OKX spot; Binance, Bybit and OKX perps; Hyperliquid's own oracle and perp mids. For stocks, metals and FX:
+
+- `pyth`: Pyth price feeds, named per asset (`pyth = "Equity.US.NVDA/USD"`). Pyth has required an API key since August 2026; put it in `HYPERKEEPER_PYTH_API_KEY`. A Pyth price whose own publish time is over 30 s old is dropped, so a market outside its trading session reads as unpriced rather than frozen.
+- `bybit-xstock`: Bybit's tokenized stocks (`NVDAXUSDT` for `NVDA`), free and around the clock, but at a premium to the stock outside regular US hours.
+
+`deploy/shadow-xyz.toml` shadows trade[XYZ]'s stocks, metals and FX with both. Each tick logs every source's quote under `quotes`, so the sources can be compared one by one.
 
 ## HIP-4 settlement
 

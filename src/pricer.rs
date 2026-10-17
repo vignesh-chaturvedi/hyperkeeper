@@ -55,10 +55,20 @@ impl Pricer {
     pub fn new(config: &Config) -> anyhow::Result<Self> {
         // A fetch has to finish inside the update interval, and the interval is at least 2.5 s.
         let timeout = Duration::from_millis(config.interval_ms.min(2_500));
+        let kinds = all_kinds(&config.sources);
+        let mut fetcher = Fetcher::new(timeout)?;
+        if kinds.contains(&SourceKind::Pyth) {
+            let feeds = config
+                .assets
+                .iter()
+                .filter_map(|a| Some((a.symbol.clone(), a.pyth.clone()?)))
+                .collect();
+            fetcher = fetcher.with_pyth(feeds);
+        }
         Ok(Self {
-            fetcher: Fetcher::new(timeout)?,
+            fetcher,
             sources: config.sources.clone(),
-            kinds: all_kinds(&config.sources),
+            kinds,
             symbols: config.assets.iter().map(|a| a.symbol.clone()).collect(),
             assets: config.assets.clone(),
             cache: HashMap::new(),

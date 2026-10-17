@@ -1,0 +1,29 @@
+# Shadow-mode keeper against trade[XYZ]'s stock, metal and FX oracle. Sends nothing that can
+# take effect. The Pyth key, if any, goes in /home/keeper/hyperkeeper/.env as
+# HYPERKEEPER_PYTH_API_KEY=...; without it only xStocks price.
+#   sudo cp deploy/hyperkeeper-shadow-xyz.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hyperkeeper-shadow-xyz
+#   journalctl -u hyperkeeper-shadow-xyz -f
+[Unit]
+Description=hyperkeeper shadow run (trade[XYZ] HIP-3 oracle, no writes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=keeper
+WorkingDirectory=/home/keeper/hyperkeeper
+# 18 assets every 3 s: a log row every 5th tick keeps the log near 35 MB a day.
+ExecStart=/home/keeper/hyperkeeper/target/release/hyperkeeper shadow --config /home/keeper/hyperkeeper/deploy/shadow-xyz.toml --out /home/keeper/hyperkeeper/data --log-every 5
+EnvironmentFile=-/home/keeper/hyperkeeper/.env
+Environment=RUST_LOG=hyperkeeper=info
+Restart=always
+RestartSec=10
+MemoryMax=300M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/keeper/hyperkeeper/data
+
+[Install]
+WantedBy=multi-user.target

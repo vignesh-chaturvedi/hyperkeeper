@@ -34,6 +34,9 @@ pub struct Options {
     pub minutes: Option<u64>,
     /// Directory for the per-tick JSONL log.
     pub out_dir: PathBuf,
+    /// Write a log row every this many ticks. The summary statistics still count every
+    /// tick.
+    pub log_every: usize,
 }
 
 #[derive(Default)]
@@ -63,6 +66,8 @@ struct Row<'a> {
     usdt_usd: Option<String>,
     sources: Vec<&'static str>,
     outliers: Vec<&'static str>,
+    /// Every spot quote this tick, after conversion, by source.
+    quotes: BTreeMap<&'static str, String>,
 }
 
 /// Fetches every source once and prints what each one says about each asset.
@@ -128,6 +133,7 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
     let mut unsent_run = 0u32;
     let mut alarms = 0usize;
     let mut probed = false;
+    let mut last_unpriced: Vec<String> = Vec::new();
 
     let deadline = options
         .minutes
@@ -199,23 +205,30 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
                 stat.deviations
                     .push_back(d.abs().to_f64().unwrap_or(f64::NAN));
             }
-            serde_json::to_writer(
-                &mut log,
-                &Row {
-                    time: chrono::Utc::now().to_rfc3339(),
-                    coin,
-                    oracle: spot.price.normalize().to_string(),
-                    sent: verdict.price().map(|p| p.normalize().to_string()),
-                    guard: label,
-                    external: external.normalize().to_string(),
-                    theirs: their_oracle.map(|t| t.normalize().to_string()),
-                    deviation_bps: deviation.and_then(|d| d.round_dp(3).to_f64()),
-                    usdt_usd: round.usdt_usd.map(|r| r.normalize().to_string()),
-                    sources: spot.used.iter().map(|k| k.name()).collect(),
-                    outliers: spot.outliers.iter().map(|(k, _)| k.name()).collect(),
-                },
-            )?;
-            log.write_all(b"\n")?;
+            if ticks.is_multiple_of(options.log_every.max(1)) {
+                serde_json::to_writer(
+                    &mut log,
+                    &Row {
+                        time: chrono::Utc::now().to_rfc3339(),
+                        coin,
+                        oracle: spot.price.normalize().to_string(),
+                        sent: verdict.price().map(|p| p.normalize().to_string()),
+                        guard: label,
+                        external: external.normalize().to_string(),
+                        theirs: their_oracle.map(|t| t.normalize().to_string()),
+                        deviation_bps: deviation.and_then(|d| d.round_dp(3).to_f64()),
+                        usdt_usd: round.usdt_usd.map(|r| r.normalize().to_string()),
+                        sources: spot.used.iter().map(|k| k.name()).collect(),
+                        outliers: spot.outliers.iter().map(|(k, _)| k.name()).collect(),
+                        quotes: spot
+                            .quotes
+                            .iter()
+                            .map(|(k, p)| (k.name(), p.normalize().to_string()))
+                            .collect(),
+                    },
+                )?;
+                log.write_all(b"\n")?;
+            }
 
             match verdict.price() {
                 Some(oracle) => prices.push(AssetPrices {
@@ -239,10 +252,14 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
         } else {
             unsent += 1;
             unsent_run += 1;
-            warn!(
-                "would not send this update; unpriced: {}",
-                unpriced.join(", ")
-            );
+            // Warn when the set of unpriced assets changes, not on every tick of a long run,
+            // such as stocks while their market is closed.
+            if unpriced != last_unpriced {
+                warn!(
+                    "would not send this update; unpriced: {}",
+                    unpriced.join(", ")
+                );
+            }
             if unsent_run == config.guards.unsent_alarm_ticks {
                 alarms += 1;
                 warn!(
@@ -251,6 +268,7 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
                 );
             }
         }
+        last_unpriced = unpriced;
 
         if last_summary.elapsed() >= Duration::from_secs(60) {
             last_summary = Instant::now();

@@ -47,6 +47,9 @@ enum Command {
         /// Directory for the per-tick JSONL log.
         #[arg(long, default_value = "data")]
         out: PathBuf,
+        /// Write a log row every this many ticks, to keep the log small for many assets.
+        #[arg(long, default_value_t = 1)]
+        log_every: usize,
     },
     /// HIP-4: predict what each binaryPrice market settles to and check it against the
     /// venue's settlement. Sends nothing.
@@ -96,12 +99,14 @@ async fn main() -> anyhow::Result<()> {
             config,
             minutes,
             out,
+            log_every,
         } => {
             shadow::run(
                 config::Config::load(&config)?,
                 shadow::Options {
                     minutes,
                     out_dir: out,
+                    log_every,
                 },
             )
             .await
