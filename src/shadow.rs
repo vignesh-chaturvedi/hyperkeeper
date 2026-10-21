@@ -4,8 +4,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -19,6 +18,7 @@ use tracing::{info, warn};
 use crate::{
     aggregate::deviation_bps,
     config::Config,
+    daily_log::DailyLog,
     dex::{self, Watch},
     guard::{Guard, Verdict},
     oracle::{self, AssetPrices},
@@ -106,15 +106,7 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
     let mut guard = Guard::new(config.guards.max_move_bps);
 
     fs::create_dir_all(&options.out_dir)?;
-    let log_path = options.out_dir.join(format!(
-        "shadow-{}-{}.jsonl",
-        config.dex,
-        chrono::Utc::now().format("%Y%m%d-%H%M")
-    ));
-    let mut log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let mut log = DailyLog::open(&options.out_dir, format!("shadow-{}", config.dex))?;
 
     let watch = dex::watch(&config);
 
@@ -122,7 +114,7 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
         dex = %config.dex,
         network = ?config.network,
         assets = config.assets.len(),
-        log = %log_path.display(),
+        log = %log.path().display(),
         "shadow mode: pricing the DEX every {} ms; nothing will be sent that can take effect",
         config.interval_ms
     );
@@ -206,28 +198,24 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
                     .push_back(d.abs().to_f64().unwrap_or(f64::NAN));
             }
             if ticks.is_multiple_of(options.log_every.max(1)) {
-                serde_json::to_writer(
-                    &mut log,
-                    &Row {
-                        time: chrono::Utc::now().to_rfc3339(),
-                        coin,
-                        oracle: spot.price.normalize().to_string(),
-                        sent: verdict.price().map(|p| p.normalize().to_string()),
-                        guard: label,
-                        external: external.normalize().to_string(),
-                        theirs: their_oracle.map(|t| t.normalize().to_string()),
-                        deviation_bps: deviation.and_then(|d| d.round_dp(3).to_f64()),
-                        usdt_usd: round.usdt_usd.map(|r| r.normalize().to_string()),
-                        sources: spot.used.iter().map(|k| k.name()).collect(),
-                        outliers: spot.outliers.iter().map(|(k, _)| k.name()).collect(),
-                        quotes: spot
-                            .quotes
-                            .iter()
-                            .map(|(k, p)| (k.name(), p.normalize().to_string()))
-                            .collect(),
-                    },
-                )?;
-                log.write_all(b"\n")?;
+                log.write(&Row {
+                    time: chrono::Utc::now().to_rfc3339(),
+                    coin,
+                    oracle: spot.price.normalize().to_string(),
+                    sent: verdict.price().map(|p| p.normalize().to_string()),
+                    guard: label,
+                    external: external.normalize().to_string(),
+                    theirs: their_oracle.map(|t| t.normalize().to_string()),
+                    deviation_bps: deviation.and_then(|d| d.round_dp(3).to_f64()),
+                    usdt_usd: round.usdt_usd.map(|r| r.normalize().to_string()),
+                    sources: spot.used.iter().map(|k| k.name()).collect(),
+                    outliers: spot.outliers.iter().map(|(k, _)| k.name()).collect(),
+                    quotes: spot
+                        .quotes
+                        .iter()
+                        .map(|(k, p)| (k.name(), p.normalize().to_string()))
+                        .collect(),
+                })?;
             }
 
             match verdict.price() {
@@ -277,7 +265,7 @@ pub async fn run(config: Config, options: Options) -> anyhow::Result<()> {
     }
 
     summarize(&stats, &watch, ticks, unsent, alarms, &pricer);
-    info!(log = %log_path.display(), "shadow run finished");
+    info!(log = %log.path().display(), "shadow run finished");
     Ok(())
 }
 

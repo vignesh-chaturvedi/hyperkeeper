@@ -2,6 +2,7 @@
 
 mod aggregate;
 mod config;
+mod daily_log;
 mod dex;
 mod failover;
 mod guard;

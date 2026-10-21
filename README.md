@@ -22,7 +22,7 @@ HIP-3 and HIP-4 deployers run write-side jobs around the clock: a HIP-3 DEX must
 | Command | What it does | Needs |
 |---|---|---|
 | `check` | Fetches every price source once and prints each one's prices | Nothing |
-| `shadow` | Every 3 s: prices the DEX, builds and signs the oracle update, and compares it with the DEX's live oracle. Writes every tick to `data/*.jsonl`. | Nothing |
+| `shadow` | Every 3 s: prices the DEX, builds and signs the oracle update, and compares it with the DEX's live oracle. Writes every tick to `data/shadow-<dex>-<date>.jsonl`. | Nothing |
 | `run --dry-run` | Everything `run` does except the send, including failover decisions | Nothing |
 | `run` | Sends the oracle update every 3 s, as a primary or a standby | A key the DEX has granted `setOracle` |
 | `hip4-shadow` | Follows every `binaryPrice` and `priceTouch` market, predicts its settlement, and checks it against the venue's | Nothing |
@@ -115,6 +115,8 @@ The templates say "TWAP" without saying how samples are weighted. So each predic
 ## Deploying
 
 `deploy/` has systemd units for the shadow, dry-run standby and HIP-4 shadow services, plus the configs they ran with. They expect a `keeper` user and the repo at `/home/keeper/hyperkeeper`.
+
+The JSONL logs start a new file each UTC day, so finished days can be compressed while the services run. The `ignp` shadow log is about 70 MB a day before compression and 6 MB after.
 
 ## Roadmap
 

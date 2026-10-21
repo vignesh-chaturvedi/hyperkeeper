@@ -14,8 +14,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -35,6 +34,7 @@ use tracing::{debug, info, warn};
 use crate::{
     aggregate::deviation_bps,
     config::Network,
+    daily_log::DailyLog,
     hip4::{self, PriceKind, PriceMarket, Rule},
 };
 
@@ -147,18 +147,12 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     let client = HttpClient::new(network.chain());
 
     fs::create_dir_all(&options.out_dir)?;
-    let stem = format!(
-        "{}-{}",
-        match network {
-            Network::Mainnet => "mainnet",
-            Network::Testnet => "testnet",
-        },
-        chrono::Utc::now().format("%Y%m%d-%H%M")
-    );
-    let log_path = options.out_dir.join(format!("hip4-shadow-{stem}.jsonl"));
-    let open = |path: &PathBuf| OpenOptions::new().create(true).append(true).open(path);
-    let mut log = open(&log_path)?;
-    let mut samples_log = open(&options.out_dir.join(format!("hip4-samples-{stem}.jsonl")))?;
+    let net = match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+    };
+    let mut log = DailyLog::open(&options.out_dir, format!("hip4-shadow-{net}"))?;
+    let mut samples_log = DailyLog::open(&options.out_dir, format!("hip4-samples-{net}"))?;
 
     let samples: Samples = Arc::default();
     let ws = match network {
@@ -209,7 +203,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 
     info!(
         ?network,
-        log = %log_path.display(),
+        log = %log.path().display(),
         "HIP-4 shadow settlement: predicting binaryPrice and priceTouch markets and checking them against the venues; nothing is sent"
     );
 
@@ -530,7 +524,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     }
 
     summarize(&stats, tracked.len());
-    info!(log = %log_path.display(), "HIP-4 shadow settlement stopped");
+    info!(log = %log.path().display(), "HIP-4 shadow settlement stopped");
     Ok(())
 }
 
@@ -555,7 +549,7 @@ fn rfc3339(ms: u64) -> String {
         .unwrap_or_default()
 }
 
-fn write(log: &mut fs::File, market: &PriceMarket, event: &str, f: Fields) -> anyhow::Result<()> {
+fn write(log: &mut DailyLog, market: &PriceMarket, event: &str, f: Fields) -> anyhow::Result<()> {
     let px = |p: Decimal| p.round_dp(6).normalize().to_string();
     let row = Row {
         time: chrono::Utc::now().to_rfc3339(),
@@ -580,15 +574,13 @@ fn write(log: &mut fs::File, market: &PriceMarket, event: &str, f: Fields) -> an
         vwap_price: f.vwap_price.map(px),
         touched_at: f.touched_at.map(rfc3339),
     };
-    serde_json::to_writer(&mut *log, &row)?;
-    log.write_all(b"\n")?;
-    Ok(())
+    log.write(&row)
 }
 
 /// Saves the samples a prediction was made from, from shortly before its window opened to
 /// now.
 fn write_samples(
-    log: &mut fs::File,
+    log: &mut DailyLog,
     market: &PriceMarket,
     start: u64,
     end: u64,
@@ -612,9 +604,7 @@ fn write_samples(
             })
             .collect(),
     };
-    serde_json::to_writer(&mut *log, &row)?;
-    log.write_all(b"\n")?;
-    Ok(())
+    log.write(&row)
 }
 
 fn summarize(stats: &Stats, following: usize) {
