@@ -6,6 +6,9 @@
 //! - `priceTouch` resolves to Yes as soon as that TWAP, taken over a rolling window, equals or
 //!   crosses the target at any time up to {time}, and to No if it never does.
 //!
+//! If the perp is delisted before the market settles, both templates settle on the perp's
+//! settlement price at delisting instead, and a touch market can settle No right then.
+//!
 //! Testnet carries numbered drafts of the same templates (`binaryPrice6`, `priceTouch2`), which
 //! read the same way. Venues use three price descriptions:
 //!
@@ -15,7 +18,7 @@
 //!   keeper records it live from the `activeAssetCtx` feed.
 //! - `the Hyperliquid <PERP> perp trade` (90 s): trade prices, recorded live.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, bail};
 use chrono::NaiveDateTime;
@@ -123,11 +126,50 @@ impl PriceMarket {
             Rule::Above(level) | Rule::Touch(level) => level,
         }
     }
+
+    /// The DEX the perp trades on, as `metaAndAssetCtxs` takes it: `None` for the main DEX.
+    pub fn dex(&self) -> Option<String> {
+        self.coin.split_once(':').map(|(dex, _)| dex.to_string())
+    }
+
+    /// What the market resolves to when its perp was delisted at `price`. A touch market is
+    /// touched if that price reaches the target from the side its TWAP started on, so it
+    /// can't be judged until that side is known.
+    pub fn resolves_at_delisting(&self, price: Decimal, from_below: Option<bool>) -> Option<bool> {
+        match self.rule {
+            Rule::Above(threshold) => Some(resolves_yes(price, threshold)),
+            Rule::Touch(target) => from_below.map(|below| {
+                if below {
+                    price >= target
+                } else {
+                    price <= target
+                }
+            }),
+        }
+    }
 }
 
 /// Yes when the settlement price is strictly above the threshold.
 pub fn resolves_yes(price: Decimal, threshold: Decimal) -> bool {
     price > threshold
+}
+
+/// The delisted perps in a `metaAndAssetCtxs` reply, with their mark prices. A delisted
+/// perp's mark stays frozen, and hyperkeeper takes it as the settlement price at delisting.
+pub fn delisted_prices(reply: &serde_json::Value) -> HashMap<String, Decimal> {
+    let (Some(universe), Some(ctxs)) = (reply[0]["universe"].as_array(), reply[1].as_array())
+    else {
+        return HashMap::new();
+    };
+    universe
+        .iter()
+        .zip(ctxs)
+        .filter(|(asset, _)| asset["isDelisted"].as_bool() == Some(true))
+        .filter_map(|(asset, ctx)| {
+            let price = ctx["markPx"].as_str()?.parse().ok()?;
+            Some((asset["name"].as_str()?.to_string(), price))
+        })
+        .collect()
 }
 
 /// Time-weighted average of a step function over `[start, end)`: each sample's price holds
@@ -373,5 +415,52 @@ mod tests {
         // Mainnet outcome 9552: xyz:SILVER, threshold 59.7, 5-minute candle TWAP 59.6496,
         // settled No.
         assert!(!resolves_yes(dec!(59.6496), dec!(59.7)));
+    }
+
+    #[test]
+    fn a_delisted_perp_settles_on_its_frozen_mark() {
+        // para:PAPER after its delisting on Oct 20, 2026, trimmed to two assets.
+        let reply = serde_json::json!([
+            { "universe": [{ "name": "para:LIVE" }, { "name": "para:PAPER", "isDelisted": true }] },
+            [{ "markPx": "1.5" }, { "markPx": "0.0259", "oraclePx": "0.0259" }]
+        ]);
+        assert_eq!(
+            delisted_prices(&reply),
+            HashMap::from([("para:PAPER".to_string(), dec!(0.0259))])
+        );
+
+        // Outcome 14106, which the venue settled No at the delisting.
+        let touch = PriceMarket::parse(
+            14106,
+            "template:priceTouch",
+            "perp:para:PAPER|priceDescription:para:PAPER-USDC perp mark|seconds:3|target:0.1|time:20261101-0000",
+            Some("out".into()),
+        )
+        .unwrap();
+        assert_eq!(touch.dex().as_deref(), Some("para"));
+        assert_eq!(
+            touch.resolves_at_delisting(dec!(0.0259), Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            touch.resolves_at_delisting(dec!(0.1), Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            touch.resolves_at_delisting(dec!(0.0259), Some(false)),
+            Some(true)
+        );
+        assert_eq!(touch.resolves_at_delisting(dec!(0.0259), None), None);
+
+        let above = PriceMarket::parse(
+            1,
+            "template:binaryPrice",
+            "perp:BTC|priceDescription:the Hyperliquid BTC perp trade|seconds:90|threshold:100000|time:20261030-2000",
+            None,
+        )
+        .unwrap();
+        assert_eq!(above.dex(), None);
+        assert_eq!(above.resolves_at_delisting(dec!(100000), None), Some(false));
+        assert_eq!(above.resolves_at_delisting(dec!(100001), None), Some(true));
     }
 }

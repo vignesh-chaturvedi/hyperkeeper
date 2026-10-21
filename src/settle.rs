@@ -7,13 +7,16 @@
 //! deadline, so it is watched from when it is first seen: its rolling TWAP is checked every
 //! few seconds, and the prediction is Yes the moment it reaches the target.
 //!
+//! If a market's perp is delisted before it settles, the templates settle on the price at
+//! delisting instead. Markets not yet predicted are checked for that every 30 s.
+//!
 //! The templates say "TWAP" without saying how samples are weighted. Each prediction also
 //! logs the plain mean of the samples and, for trades, the VWAP, and every recorded window's
 //! raw samples go to a second log (`hip4-samples-*.jsonl`), so a disagreement with a venue
 //! can be replayed under other definitions.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -68,6 +71,7 @@ const GRACE_MS: u64 = 10_000;
 const GIVE_UP_MS: u64 = 24 * 3_600_000;
 /// Predictions closer to the threshold than this are reported as close calls.
 const CLOSE_CALL_BPS: f64 = 2.0;
+const DELISTED_NOTE: &str = "perp delisted: judged on the price at delisting";
 
 struct Tracked {
     market: PriceMarket,
@@ -78,6 +82,11 @@ struct Tracked {
     checked_to: u64,
     /// For a touch market: when its TWAP first reached the target.
     touched_at: Option<u64>,
+    /// When hyperkeeper first saw the market's perp delisted.
+    delisted_at: Option<u64>,
+    /// The venue settled the market before any prediction. It gets one more check for a
+    /// delisting before it counts as a miss.
+    settled_early: bool,
 }
 
 #[derive(Default)]
@@ -300,6 +309,8 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                                 from_below: None,
                                 checked_to: now,
                                 touched_at: None,
+                                delisted_at: None,
+                                settled_early: false,
                             },
                         );
                     }
@@ -436,6 +447,65 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         // Check predictions against the venues' settlements.
         if last_settle_check.elapsed() >= Duration::from_secs(30) {
             last_settle_check = Instant::now();
+            // Markets not yet predicted whose perp has been delisted settle on the price at
+            // delisting. One request per DEX covers all of its markets.
+            let open = |t: &Tracked| t.predicted.is_none() && t.touched_at.is_none();
+            let dexes: BTreeSet<Option<String>> = tracked
+                .values()
+                .filter(|t| open(t))
+                .map(|t| t.market.dex())
+                .collect();
+            for dex in dexes {
+                let delisted = match client.meta_and_asset_ctxs(dex.clone()).await {
+                    Ok(reply) => hip4::delisted_prices(&reply),
+                    Err(err) => {
+                        debug!(?dex, "metaAndAssetCtxs failed: {err:#}");
+                        continue;
+                    }
+                };
+                debug!(
+                    ?dex,
+                    delisted = delisted.len(),
+                    "checked for delisted perps"
+                );
+                let ids: Vec<u64> = tracked
+                    .iter()
+                    .filter(|(_, t)| open(t) && delisted.contains_key(&t.market.coin))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in ids {
+                    let t = tracked.get_mut(&id).expect("tracked");
+                    let market = t.market.clone();
+                    let price = delisted[&market.coin];
+                    t.delisted_at = Some(now);
+                    let Some(yes) = market.resolves_at_delisting(price, t.from_below) else {
+                        stats.unpredictable += 1;
+                        let note = Some("perp delisted before its TWAP's starting side was known");
+                        write(
+                            &mut log,
+                            &market,
+                            "unpredictable",
+                            Fields {
+                                note,
+                                ..Fields::default()
+                            },
+                        )?;
+                        tracked.remove(&id);
+                        continue;
+                    };
+                    t.predicted = Some((price, yes));
+                    stats.predicted += 1;
+                    warn!(id, coin = %market.coin, %price, yes, "perp delisted; predicting from the price at delisting");
+                    let fields = Fields {
+                        price: Some(price),
+                        predicted_yes: Some(yes),
+                        margin_bps: deviation_bps(price, market.level()).to_f64(),
+                        note: Some(DELISTED_NOTE),
+                        ..Fields::default()
+                    };
+                    write(&mut log, &market, "predicted", fields)?;
+                }
+            }
             // Touch markets are checked before any prediction too, to catch a touch the venue
             // saw and hyperkeeper didn't.
             let waiting: Vec<u64> = tracked
@@ -455,8 +525,10 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 let market = tracked_market.market.clone();
                 let predicted = tracked_market.predicted;
                 let touched_at = tracked_market.touched_at;
-                // Lag counts from when the result was known: the expiry, or the touch.
-                let known_at = touched_at.unwrap_or(market.time_ms);
+                let delisted_at = tracked_market.delisted_at;
+                // Lag counts from when the result was known: the expiry, the touch, or when
+                // hyperkeeper saw the delisting.
+                let known_at = touched_at.or(delisted_at).unwrap_or(market.time_ms);
                 let Some(settled) = settled else {
                     if let Some((price, predicted_yes)) = predicted
                         && now > known_at + GIVE_UP_MS
@@ -475,22 +547,33 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 };
                 // These outcomes pay their first side, YES, in full or not at all.
                 let actual_yes = settled.settle_fraction == Decimal::ONE;
-                stats.settled += 1;
                 let Some((price, predicted_yes)) = predicted else {
                     // Only a touch market gets here: the venue settled it before hyperkeeper
-                    // saw its TWAP reach the target.
+                    // saw a touch. A delisting can settle it too, so give the next check
+                    // for delistings a chance before counting a miss.
+                    if !tracked_market.settled_early {
+                        tracked.get_mut(&id).expect("tracked").settled_early = true;
+                        continue;
+                    }
+                    stats.settled += 1;
                     stats.mismatched.push(id);
                     let target = market.level();
-                    warn!(id, coin = %market.coin, %target, actual_yes, "settled before hyperkeeper saw a touch");
+                    let note = if actual_yes {
+                        "settled Yes before hyperkeeper saw a touch"
+                    } else {
+                        "settled No early, with no delisting seen"
+                    };
+                    warn!(id, coin = %market.coin, %target, actual_yes, "{note}");
                     let fields = Fields {
                         actual_yes: Some(actual_yes),
-                        note: Some("settled before hyperkeeper saw a touch"),
+                        note: Some(note),
                         ..Fields::default()
                     };
                     write(&mut log, &market, "settled", fields)?;
                     tracked.remove(&id);
                     continue;
                 };
+                stats.settled += 1;
                 let lag_s = (now.saturating_sub(known_at)) as f64 / 1000.0;
                 if actual_yes == predicted_yes {
                     stats.matched += 1;
@@ -503,12 +586,16 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 if matches!(market.rule, Rule::Touch(_)) {
                     bucket.push_str(" touch");
                 }
+                if delisted_at.is_some() {
+                    bucket.push_str(" delisted");
+                }
                 stats.settle_lag.entry(bucket).or_default().push(lag_s);
                 let fields = Fields {
                     price: Some(price),
                     predicted_yes: Some(predicted_yes),
                     actual_yes: Some(actual_yes),
                     settle_lag_s: Some(lag_s),
+                    note: delisted_at.map(|_| DELISTED_NOTE),
                     touched_at,
                     ..Fields::default()
                 };

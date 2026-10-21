@@ -106,6 +106,8 @@ A `binaryPrice` outcome settles YES if the `{seconds}`-second TWAP of the named 
 
 A `priceTouch` outcome settles YES as soon as the `{seconds}`-second TWAP equals or crosses the target, at any time up to `{time}`, and NO if it never does. `hip4-shadow` watches each one from when it first sees it: every few seconds it checks the rolling TWAP, and predicts YES the moment it reaches the target. Between the moments a sample enters or leaves the window, that TWAP moves in a straight line, so checking those moments finds every touch. If the venue settles a touch that hyperkeeper didn't see, it counts as a miss.
 
+If a market's perp is delisted before the market settles, both templates settle on the perp's settlement price at delisting instead, and a touch market can settle NO right then. Every 30 s, `hip4-shadow` checks the DEXes of the markets it hasn't predicted yet. For any whose perp is delisted, it predicts from that perp's mark price, which freezes at delisting. Those rows carry a note, and their settle lag counts from when hyperkeeper saw the delisting.
+
 It then polls the venue's settlement and logs each prediction, the venue's result and the settle lag to `data/hip4-shadow-*.jsonl`. For a touch, the lag counts from the touch.
 
 Testnet also lists numbered drafts of these templates, such as `binaryPrice6` and `priceTouch2`. They read the same way and are handled the same. `scalarPrice` and `binaryPriceExternal` are not supported yet.
